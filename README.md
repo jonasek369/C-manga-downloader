@@ -9,6 +9,7 @@ very early in development
 [stb_image.h](https://github.com/nothings/stb)  
 [libwebp](https://github.com/webmproject/libwebp)  
 [libcurl](https://curl.se/windows/)  
+[json_parser.h](https://github.com/jonasek369/C-JSON), my own json implementation just renamed parser.h -> json_parser.h
 
 
 ## Compilation
