@@ -5,8 +5,6 @@
 #include <webp/encode.h>
 #include <webp/types.h>
 
-#include "test.h" // output from LMDX-download-job as string
-
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
@@ -21,6 +19,109 @@
 #define CERTIFICATE_PATH "curl-ca-bundle.crt"
 #define UUID4_SIZE 36
 #define CHAPTER_DOWNLOAD_URL_SIZE 40
+
+atomic_bool paused = false;
+atomic_bool stopped = false;
+atomic_bool downloading = false;
+atomic_bool ratelimited = false;
+
+atomic_int job_chapters_downloaded = 0;
+atomic_int job_chapters = 0;
+
+
+CRITICAL_SECTION cs;
+char shared_cwo[37];
+
+void init_cwo() {
+    InitializeCriticalSection(&cs);
+}
+
+void set_cwo(const char *s) {
+    EnterCriticalSection(&cs);
+    strncpy(shared_cwo, s, 36);
+    shared_cwo[36] = '\0';
+    LeaveCriticalSection(&cs);
+}
+
+void get_cwo(char *buffer, size_t size) {
+    EnterCriticalSection(&cs);
+    strncpy(buffer, shared_cwo, size - 1);
+    buffer[size - 1] = '\0';
+    LeaveCriticalSection(&cs);
+}
+
+void cleanup_cwo() {
+    DeleteCriticalSection(&cs);
+}
+
+
+static void sb_append(char **buf, const char *fmt, ...) {
+    char temp[1024];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(temp, sizeof(temp), fmt, args);
+    va_end(args);
+
+    if (n < 0) return;
+
+    if ((size_t)n >= sizeof(temp)) {
+        char *heapbuf = malloc(n + 1);
+        va_start(args, fmt);
+        vsnprintf(heapbuf, n + 1, fmt, args);
+        va_end(args);
+        for (int i = 0; i < n; i++)
+            arrpush(*buf, heapbuf[i]);
+        free(heapbuf);
+    } else {
+        for (int i = 0; i < n; i++)
+            arrpush(*buf, temp[i]);
+    }
+}
+
+// Single-line JSON serialization
+void json_print_compact(JsonValue *json, char **out) {
+    switch (json->type) {
+        case JSON_OBJECT: {
+            sb_append(out, "{");
+            JsonPair *pairs = json->object;
+            size_t first = 1;
+            for (size_t slot = 0; slot < hmlenu(pairs); slot++) {
+                if (pairs[slot].key == NULL) continue;
+                if (!first) sb_append(out, ",");
+                first = 0;
+                sb_append(out, "\"%s\":", pairs[slot].key);
+                json_print_compact(pairs[slot].value, out);
+            }
+            sb_append(out, "}");
+            break;
+        }
+
+        case JSON_ARRAY: {
+            sb_append(out, "[");
+            JsonValue **values = json->array;
+            size_t count = arrlen(values);
+            for (size_t i = 0; i < count; i++) {
+                if (i > 0) sb_append(out, ",");
+                json_print_compact(values[i], out);
+            }
+            sb_append(out, "]");
+            break;
+        }
+
+        case JSON_STRING:
+            sb_append(out, "\"%s\"", json->string);
+            break;
+        case JSON_NUMBER:
+            sb_append(out, "%g", json->number);
+            break;
+        case JSON_BOOL:
+            sb_append(out, "%s", json->boolean ? "true" : "false");
+            break;
+        case JSON_NULL:
+            sb_append(out, "null");
+            break;
+    }
+}
 
 
 typedef struct {
@@ -51,29 +152,111 @@ size_t write_image_callback(char *contents, size_t size, size_t nmemb, void *use
     return total_size;
 }
 
+size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
+    size_t total_size = size * nitems;
+    char **headers = (char **)userdata;
 
-void get_request_json(const char* url, Arena* arena, JsonValue* out){
+    // Append header data
+    for (size_t i = 0; i < total_size; i++) {
+        arrput(*headers, buffer[i]);
+    }
+
+    return total_size;
+}
+
+
+typedef struct {
+    int32_t remaining;
+    float retryAfter;
+} RateLimitHeader;
+
+
+
+
+void parse_header_to_json(Arena* arena, const char* headers, JsonValue* out) {
+    const char* line_start = headers;
+    const char* p = headers;
+
+    while (*p) {
+        if (*p == '\n' || *(p+1) == '\0') {
+            const char* line_end = (*p == '\n') ? p : p + 1;
+            const char* colon = memchr(line_start, ':', line_end - line_start);
+
+            if (colon) {
+                size_t name_len = colon - line_start;
+                char* name = arena_alloc(arena, name_len + 1);
+                memcpy(name, line_start, name_len);
+                name[name_len] = '\0';
+
+                const char* value_start = colon + 1;
+                while (value_start < line_end && (*value_start == ' ' || *value_start == '\t')) {
+                    value_start++;
+                }
+
+                const char* value_end = line_end;
+                while (value_end > value_start && 
+                       (*(value_end - 1) == ' ' || *(value_end - 1) == '\t' || *(value_end - 1) == '\r' || *(value_end - 1) == '\n')) {
+                    value_end--;
+                }
+
+                size_t value_len = value_end - value_start;
+                char* value = arena_alloc(arena, value_len + 1);
+                memcpy(value, value_start, value_len);
+                value[value_len] = '\0';
+
+                json_add_child(out, name, json_new_nstring(arena, value, value_len));
+            }
+
+            line_start = p + 1;
+        }
+        p++;
+    }
+}
+
+
+
+void get_request_json(const char* url, Arena* arena, JsonValue* out, RateLimitHeader* rlh){
     CURL *curl = curl_easy_init();
     CURLcode res;
     char* response = NULL;
+    char* headers = NULL;
     curl_easy_setopt(curl, CURLOPT_CAINFO, CERTIFICATE_PATH);
     curl_easy_setopt(curl, CURLOPT_URL, url);
 
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+    
+
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Libcurl;Custom-Cjson/1.0");
 
     res = curl_easy_perform(curl);
+
     if(res == CURLE_OK){
-    	arrput(response, '\0');
+        JsonValue json_headers = {0};
+        json_init_object(&json_headers);
+        arrput(headers, '\0');
+        arrput(response, '\0');
         jsonStringLoad(response, arena, out);
+        parse_header_to_json(arena, headers, &json_headers);
+
+        if(shget(json_headers.object, "x-ratelimit-remaining") != NULL){
+            rlh->remaining = atoi(shget(json_headers.object, "x-ratelimit-remaining")->string);
+        }
+        if(shget(json_headers.object, "x-ratelimit-retry-after") != NULL){
+            rlh->retryAfter = atof(shget(json_headers.object, "x-ratelimit-retry-after")->string);
+        }
+
         curl_easy_cleanup(curl);
         arrfree(response);
+        arrfree(headers);
         return;
     }
     curl_easy_cleanup(curl);
     arrfree(response);
+    arrfree(headers);
     return;
 }
 
@@ -133,35 +316,60 @@ bool save_finish_metadata(const char* filedir){
     FILE *file = fopen(filedir, "w");
     if (file == NULL) {
         perror("Failed to create file");
-        return 1;
+        return false;
     }
     fclose(file);
+    return true;
 }
 
-
 void page_download_callback(const char* path, char* data) {
-    int width, height, channels;
-
     size_t data_size = arrlenu(data);
-    uint8_t* pixels = stbi_load_from_memory((uint8_t*)data, (int)data_size, &width, &height, &channels, 4);
-    if (!pixels) {
-        printf("Failed to decode image\n");
+    
+    if (data_size > 12 && memcmp(data, "RIFF", 4) == 0 && 
+        memcmp(data + 8, "WEBP", 4) == 0) {
+        save_webp_to_file(path, (uint8_t*)data, data_size);
         return;
     }
-
-    uint8_t* webp_data;
-    /* TODO: Change compression */
-    size_t output_size  = WebPEncodeRGBA(pixels, width, height, width * 4, 80, &webp_data);
-    if (output_size == 0) {
-        printf("Failed to encode WebP\n");
+    
+    int width, height, channels;
+    uint8_t* pixels = stbi_load_from_memory((uint8_t*)data, (int)data_size, 
+                                            &width, &height, &channels, 4);
+    if (!pixels) {
+        fprintf(stderr, "Failed to decode image\n");
+        return;
+    }
+    
+    WebPConfig config;
+    WebPConfigInit(&config);
+    config.quality = 80;
+    config.method = 0;
+    config.thread_level = 1;
+    
+    WebPPicture picture;
+    WebPPictureInit(&picture);
+    picture.width = width;
+    picture.height = height;
+    picture.use_argb = 1;
+    
+    WebPPictureImportRGBA(&picture, pixels, width * 4);
+    
+    WebPMemoryWriter writer;
+    WebPMemoryWriterInit(&writer);
+    picture.writer = WebPMemoryWrite;
+    picture.custom_ptr = &writer;
+    
+    if (!WebPEncode(&config, &picture)) {
+        fprintf(stderr, "Failed to encode WebP\n");
+        WebPPictureFree(&picture);
         stbi_image_free(pixels);
         return;
     }
-
-    save_webp_to_file(path, webp_data, output_size);
-
+    
+    save_webp_to_file(path, writer.mem, writer.size);
+    
+    WebPMemoryWriterClear(&writer);
+    WebPPictureFree(&picture);
     stbi_image_free(pixels);
-    WebPFree(webp_data);
 }
 
 
@@ -175,7 +383,17 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
     // TODO: Check for rate limiting
     snprintf(url, url_size, "%s%s", base, chapterId);
     JsonValue metadata = {0};
-    get_request_json(url, arena, &metadata);
+    RateLimitHeader ratelimit = {0};
+    get_request_json(url, arena, &metadata, &ratelimit);
+    if(ratelimit.remaining <= 0){
+        time_t now = time(NULL);
+        time_t remaining = (ratelimit.retryAfter - now) + 5;
+        if (remaining > 0) {
+            atomic_store(&ratelimited, true);
+            Sleep(remaining * 1000);
+            atomic_store(&ratelimited, false);
+        }
+    }
     JsonValue* chapter = shget(metadata.object, "chapter");
     if(!chapter){
     	fprintf(stderr, "Chapter is null!\n");
@@ -196,8 +414,12 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
     CURL **easy_handles = malloc(num_requests * sizeof(CURL *));
     request_buffer *buffers = calloc(num_requests, sizeof(request_buffer));
 
-    curl_global_init(CURL_GLOBAL_ALL);
     CURLM *multi = curl_multi_init();
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 32);
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, 0);
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, 128);
+
 
     size_t finish_path_size = strlen(main_dir)+strlen(chapterId) + 11; // for / / null F I N I S H E D
     char* finish_path = arena_alloc(arena, finish_path_size);
@@ -217,6 +439,8 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
         curl_easy_setopt(easy_handles[i], CURLOPT_WRITEDATA, &buffers[i]);
         curl_easy_setopt(easy_handles[i], CURLOPT_USERAGENT, "Libcurl;Custom-Cjson/1.0");
         curl_easy_setopt(easy_handles[i], CURLOPT_CAINFO, CERTIFICATE_PATH);
+        curl_easy_setopt(easy_handles[i], CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+        curl_easy_setopt(easy_handles[i], CURLOPT_DNS_CACHE_TIMEOUT, 600);
         curl_multi_add_handle(multi, easy_handles[i]);
     }
 
@@ -224,7 +448,7 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
     curl_multi_perform(multi, &still_running);
 
     while (still_running) {
-        curl_multi_poll(multi, NULL, 0, 200, NULL);
+        curl_multi_wait(multi, NULL, 0, 1000, NULL);
         curl_multi_perform(multi, &still_running);
 
         CURLMsg *msg;
@@ -249,10 +473,10 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
     free(easy_handles);
     free(buffers);
     curl_multi_cleanup(multi);
-    curl_global_cleanup();
-    save_finish_metadata(finish_path);
+    if(save_finish_metadata(finish_path)){
+        fprintf(stderr, "Could not save metadata for cuuid: %s\n", chapterId);
+    }
 }
-
 
 char* json_value_to_string(Arena* arena, JsonValue* value) {
     if (value->type == JSON_STRING) {
@@ -315,7 +539,7 @@ char* build_parameterized_url(Arena* arena, const char* baseUrl, JsonValue* para
     for(size_t i = 0; i < shlenu(params->object); i++){
         const char* key = params->object[i].key;
         if(params->object[i].value->type == JSON_OBJECT){
-            printf("Warn: Object is not supported in parameterization! Skipping\n");
+            fprintf(stderr, "Warn: Object is not supported in parameterization! Skipping\n");
             continue;
         }
         else if(params->object[i].value->type == JSON_ARRAY){
@@ -334,13 +558,6 @@ char* build_parameterized_url(Arena* arena, const char* baseUrl, JsonValue* para
     return parameterized_url;
 }
 
-atomic_bool paused = false;
-atomic_bool stopped = false;
-atomic_bool downloading = false;
-atomic_bool ratelimited = false;
-
-atomic_int job_chapters_downloaded = 0;
-atomic_int job_chapters = 0;
 
 typedef struct {
 	char identifier[37];
@@ -348,6 +565,64 @@ typedef struct {
 	JsonValue* databaseInfo;
 } MangaDownloadJob;
 
+
+JsonValue *json_dup(const JsonValue *src) {
+    if (!src) return NULL;
+
+    JsonValue *dst = malloc(sizeof(JsonValue));
+    if (!dst) return NULL;
+
+    dst->type = src->type;
+
+    switch (src->type)
+    {
+        case JSON_ARRAY: {
+            dst->array = NULL; // required before arrput
+            size_t count = arrlenu(src->array);
+
+            for (size_t i = 0; i < count; i++) {
+                JsonValue *elem_copy = json_dup(src->array[i]);
+                arrput(dst->array, elem_copy);
+            }
+            break;
+        }
+
+        case JSON_OBJECT: {
+            dst->object = NULL; // required before shput
+
+            size_t count = shlenu(src->object);
+            for (size_t i = 0; i < count; i++) {
+                const char *key = src->object[i].key;
+
+                JsonValue *val_copy = json_dup(src->object[i].value);
+
+                // shput duplicates the key automatically if necessary
+                shput(dst->object, key, val_copy);
+            }
+            break;
+        }
+
+        case JSON_STRING:
+            // If your strings are arena-allocated, do NOT strdup — just reuse
+            // If they should be copied independently, use strdup:
+            dst->string = src->string ? strdup(src->string) : NULL;
+            break;
+
+        case JSON_NUMBER:
+            dst->number = src->number;
+            break;
+
+        case JSON_BOOL:
+            dst->boolean = src->boolean;
+            break;
+
+        case JSON_NULL:
+        default:
+            break;
+    }
+
+    return dst;
+}
 
 typedef struct {
     MangaDownloadJob* buffer;
@@ -411,11 +686,16 @@ DWORD WINAPI download_loop(LPVOID param) {
     MangaDownloadJob job;
     bool has_job = false;
     Arena local_arena = {0};
-    printf("thread started!\n");
+    fprintf(stderr, "thread started!\n");
+
+    curl_global_init(CURL_GLOBAL_ALL);
     while (!atomic_load(&stopped)) {
     	loop_start:
         if (atomic_load(&paused)) {
-            if (has_job) pushQueue(queue, job);
+            if (has_job){
+                pushQueue(queue, job);
+                set_cwo("null");
+            }
             has_job = false;
             atomic_store(&downloading, false);
             Sleep(100);
@@ -433,6 +713,7 @@ DWORD WINAPI download_loop(LPVOID param) {
 
         has_job = true;
         atomic_store(&downloading, true);
+        set_cwo(job.identifier);
 
         for(size_t i = 0; i < arrlenu(job.chapterInfo->array); i++){
         	if(atomic_load(&paused) || atomic_load(&stopped)){
@@ -449,8 +730,8 @@ DWORD WINAPI download_loop(LPVOID param) {
         	JsonValue* records = shget(job.databaseInfo->object, "records");
         	JsonValue* chapterPagesInDb = shget(pagesInDbJson->object, chapterId);
         	if(chapterPagesInDb != NULL && records != NULL){
-        		int record = (int)shget(records->object, chapterId)->number;
-        		if(arrlen(chapterPagesInDb) == record){
+        		size_t record = (size_t)shget(records->object, chapterId)->number;
+        		if(arrlenu(chapterPagesInDb->array) == record){
         			continue;
         		}
         	}
@@ -458,44 +739,219 @@ DWORD WINAPI download_loop(LPVOID param) {
         	download_chapter(chapterId, &local_arena, "downloads");
         }
         arena_reset(&local_arena);
+        json_free(job.chapterInfo);
+        json_free(job.databaseInfo);
+
+        has_job = false;
+        atomic_store(&downloading, false);
+        set_cwo("null");
     }
-    printf("thread ending!\n");
+    fprintf(stderr, "thread ending!\n");
+    curl_global_cleanup();
     arena_free(&local_arena);
     return 0;
 }
+
+JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
+    JsonValue* type = shget(command->object, "command");
+    if(!type){
+        fprintf(stderr, "command type is not present!\n");
+        return NULL;
+    }
+    else if(strncmp(type->string, "exit", 4) == 0){
+        atomic_store(&stopped, true);
+        return NULL;
+    }
+    else if(strncmp(type->string, "pause", 5) == 0){
+        atomic_store(&paused, true);
+        return NULL;
+    }else if(strncmp(type->string, "resume", 6) == 0){
+        atomic_store(&paused, false);
+        return NULL;
+    }else if(strncmp(type->string, "status", 6) == 0){
+        JsonValue* response = arena_alloc(arena, sizeof(JsonValue));
+        JsonValue* queueJson = arena_alloc(arena, sizeof(JsonValue));
+        char cwo_str[37];
+
+        json_init_object(response);
+        json_init_array(queueJson);
+
+        get_cwo(cwo_str, 36);
+
+        EnterCriticalSection(&queue->lock);
+
+        for (int i = 0; i < queue->count; i++) {
+            int index = (queue->head + i) % queue->capacity;
+            MangaDownloadJob job = queue->buffer[index];
+        
+            json_add_child(queueJson, NULL, json_new_string(arena, job.identifier));
+        }
+        
+        LeaveCriticalSection(&queue->lock);
+
+        json_add_child(response, "paused",      json_new_bool(arena, atomic_load(&paused)));
+        json_add_child(response, "ratelimited", json_new_bool(arena, atomic_load(&ratelimited)));
+        json_add_child(response, "downloading", json_new_bool(arena, atomic_load(&downloading)));
+        json_add_child(response, "queue", queueJson);
+        json_add_child(response, "cwo", json_new_string(arena, cwo_str));
+
+        return response;
+    }else if(strncmp(type->string, "add-job", 7) == 0){
+        JsonValue* data = shget(command->object, "data");
+        JsonValue* response = arena_alloc(arena, sizeof(JsonValue));
+        json_init_object(response);
+
+        if(!data){
+            fprintf(stderr, "Add-job dosent have all needed values!\n");
+            json_add_child(response, "status", json_new_string(arena, "error"));
+            json_add_child(response, "message", json_new_string(arena, "No data field provided"));
+            return response;
+        }
+
+        JsonValue* chapterInfo = shget(data->object, "chapter_info");
+        JsonValue* databaseInfo = shget(data->object, "database_info");
+
+        if(!chapterInfo || !databaseInfo){
+            fprintf(stderr, "chapter or database info is NULL!\n");
+            json_add_child(response, "status", json_new_string(arena, "error"));
+            json_add_child(response, "message", json_new_string(arena, "No chapterInfo or databaseInfo field provided"));
+            return response;
+        }
+
+        MangaDownloadJob job = {0};
+        const char* id = shget(data->object, "identifier")->string;
+        strncpy(job.identifier, id, sizeof(job.identifier) - 1);
+        job.identifier[sizeof(job.identifier) - 1] = '\0';
+
+        job.chapterInfo = json_dup(chapterInfo);
+        job.databaseInfo = json_dup(databaseInfo);
+
+        pushQueue(queue, job);
+        json_add_child(response, "status", json_new_string(arena, "ok"));
+        return response;
+    }else if(strncmp(type->string, "pop-job", 7) == 0){
+        JsonValue* data = shget(command->object, "data");
+        JsonValue* response = arena_alloc(arena, sizeof(JsonValue));
+        json_init_object(response);
+
+        if(!data){
+            fprintf(stderr, "Add-job dosent have all needed values!\n");
+            json_add_child(response, "status", json_new_string(arena, "error"));
+            json_add_child(response, "message", json_new_string(arena, "No data field provided"));
+            return response;
+        }
+
+        const char* id = shget(data->object, "identifier")->string;
+
+
+        EnterCriticalSection(&queue->lock);
+
+        for (int i = queue->count - 1; i >= 0; i--) {
+            int index = (queue->head + i) % queue->capacity;
+            MangaDownloadJob job = queue->buffer[index];
+        
+            if (strncmp(job.identifier, id, 36) == 0) {
+                for (int j = i; j < queue->count - 1; j++) {
+                    int from = (queue->head + j + 1) % queue->capacity;
+                    int to   = (queue->head + j) % queue->capacity;
+                    queue->buffer[to] = queue->buffer[from];
+                }
+                queue->tail = (queue->tail - 1 + queue->capacity) % queue->capacity;
+                queue->count--;
+            }
+        }
+        
+        LeaveCriticalSection(&queue->lock);
+        json_add_child(response, "status", json_new_string(arena, "ok"));
+        return response;
+    }
+
+
+    return NULL;
+}
+
+
 
 int main(void)
 {
 	Arena arena = {0};
 	JobQueue queue = {0};
 	initQueue(&queue, 100);
-	/*
-	  TODO: Add IPC with the main program
-	*/
-
-	JsonValue json_data = {0};
-	jsonStringLoad(full_data, &arena, &json_data);
-
-	MangaDownloadJob job = {0};
-	memcpy(job.identifier, shget(json_data.object, "identifier")->string, 36);
-	job.identifier[36] = '\0';
-	job.chapterInfo = shget(shget(json_data.object, "chapter_info")->object, "data");
-	job.databaseInfo = shget(json_data.object, "database_info");
-
-	pushQueue(&queue, job);
+    init_cwo();
+    set_cwo("null");
 
 	nob_mkdir_if_not_exists("downloads");
 
 	HANDLE thread = CreateThread(NULL, 0, download_loop, (void*)&queue, 0, NULL);
     if (thread == NULL) {
-        printf("Failed to create worker thread!\n");
+        fprintf(stderr, "Failed to create worker thread!\n");
         return 1;
     }
 
+    JsonValue command = {0};
+    uint32_t length;
+    while (fread(&length, sizeof(length), 1, stdin) == 1) {
+        char *buffer = malloc(length + 1);
+        if (!buffer) {
+            fprintf(stderr, "Memory allocation failed\n");
+            return 1;
+        }
+
+        size_t read_bytes = fread(buffer, 1, length, stdin);
+        if (read_bytes != length) {
+            fprintf(stderr, "Incomplete read (%zu of %u bytes)\n", read_bytes, length);
+            free(buffer);
+            break;
+        }
+
+        buffer[length] = '\0';
+
+
+        jsonStringLoad(buffer, &arena, &command);
+
+
+        if(command.object == NULL){
+            fprintf(stderr, "Recieved invalid buffer from proc\n");
+            free(buffer);
+            continue;
+        }
+
+        JsonValue* response = handle_command(&arena, &queue, &command);
+
+        if(response){
+            // TODO: Sending response dose not work recieve does            
+            char *json_buf = NULL;
+
+            json_print_compact(response, &json_buf);
+            arrpush(json_buf, '\0');
+    
+            uint32_t resp_len = arrlenu(json_buf) - 1;
+            fwrite(&resp_len, sizeof(resp_len), 1, stdout);
+            fwrite(json_buf, 1, resp_len, stdout);
+            fflush(stdout);
+    
+            arrfree(json_buf);
+            json_free(response);
+        }
+
+        if(command.object){
+            json_free(&command);
+            memset(&command, 0, sizeof(JsonValue));
+        }
+
+
+        free(buffer);
+        arena_reset(&arena);
+        // If the command was exit we break 
+        if(atomic_load(&stopped)){
+            break;
+        }
+    }
 	WaitForSingleObject(thread, INFINITE);
     CloseHandle(thread);
 
     arena_free(&arena);
+    cleanup_cwo();
     destroyQueue(&queue);
     return 0;
 }
