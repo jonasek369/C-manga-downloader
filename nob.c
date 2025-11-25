@@ -3,11 +3,12 @@
 
 #define output "main.exe"
 
-#define webp_incl "C:/Users/mato/Downloads/libwebp-1.6.0/src"
-#define webp_lib  "C:/Users/mato/Downloads/libwebp-1.6.0/build"
 
-#define curl_incl "C:/Users/mato/Downloads/curl-8.17.0_1-win64-mingw/include"
-#define curl_lib  "C:/Users/mato/Downloads/curl-8.17.0_1-win64-mingw/lib"
+#define webp_incl "your/path/here/to/src"
+#define webp_lib  "your/path/here/to/build"
+
+#define curl_incl "your/path/here/to/include"
+#define curl_lib  "your/path/here/to/lib"
 
 int main(int argc, char **argv)
 {
@@ -26,13 +27,14 @@ int main(int argc, char **argv)
         "main.c",
         "-lwebp",   // link webp
         "-lcurl",    // link curl
-        "-lsharpyuv"
+        "-lsharpyuv",
+        "-O2"
     );
 
     if (!nob_cmd_run_sync_and_reset(&cmd)) return 1;
 
-    nob_cmd_append(&cmd, "./" output);
-    if (!nob_cmd_run_sync_and_reset(&cmd)) return 1;
+    //nob_cmd_append(&cmd, "./" output);
+    //if (!nob_cmd_run_sync_and_reset(&cmd)) return 1;
 
     return 0;
 }

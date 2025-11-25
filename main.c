@@ -26,6 +26,7 @@ atomic_bool downloading = false;
 atomic_bool ratelimited = false;
 
 atomic_int job_chapters_downloaded = 0;
+
 atomic_int job_chapters = 0;
 
 
@@ -373,14 +374,13 @@ void page_download_callback(const char* path, char* data) {
 }
 
 
-void download_chapter(const char* chapterId, Arena* arena, const char* main_dir){
+int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_dir){
     const char* base = "https://api.mangadex.org/at-home/server/";
     if(strlen(chapterId) != UUID4_SIZE){
-        return;
+        return -1;
     }
     size_t url_size = strlen(base) + strlen(chapterId) + 1; // +1 for null terminator
     char* url = arena_alloc(arena, url_size);
-    // TODO: Check for rate limiting
     snprintf(url, url_size, "%s%s", base, chapterId);
     JsonValue metadata = {0};
     RateLimitHeader ratelimit = {0};
@@ -397,7 +397,7 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
     JsonValue* chapter = shget(metadata.object, "chapter");
     if(!chapter){
     	fprintf(stderr, "Chapter is null!\n");
-    	return;
+    	return -1;
     }
     char* hash = shget(chapter->object, "hash")->string;
     char* baseUrl = shget(metadata.object, "baseUrl")->string;
@@ -408,7 +408,7 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
 	char* in_dir = arena_alloc(arena, in_dir_size);
 	snprintf(in_dir, in_dir_size, "%s/%s", main_dir, chapterId);
 
-    if(!nob_mkdir_if_not_exists(in_dir)) return;
+    if(!nob_mkdir_if_not_exists(in_dir)) return -1;
 
     size_t num_requests = arrlenu(pages);
     CURL **easy_handles = malloc(num_requests * sizeof(CURL *));
@@ -476,6 +476,7 @@ void download_chapter(const char* chapterId, Arena* arena, const char* main_dir)
     if(save_finish_metadata(finish_path)){
         fprintf(stderr, "Could not save metadata for cuuid: %s\n", chapterId);
     }
+    return (int32_t)num_requests;
 }
 
 char* json_value_to_string(Arena* arena, JsonValue* value) {
@@ -695,6 +696,7 @@ DWORD WINAPI download_loop(LPVOID param) {
             if (has_job){
                 pushQueue(queue, job);
                 set_cwo("null");
+                atomic_store(&job_chapters_downloaded, 0);
             }
             has_job = false;
             atomic_store(&downloading, false);
@@ -714,6 +716,7 @@ DWORD WINAPI download_loop(LPVOID param) {
         has_job = true;
         atomic_store(&downloading, true);
         set_cwo(job.identifier);
+        atomic_store(&job_chapters, arrlen(job.chapterInfo->array));
 
         for(size_t i = 0; i < arrlenu(job.chapterInfo->array); i++){
         	if(atomic_load(&paused) || atomic_load(&stopped)){
@@ -732,11 +735,25 @@ DWORD WINAPI download_loop(LPVOID param) {
         	if(chapterPagesInDb != NULL && records != NULL){
         		size_t record = (size_t)shget(records->object, chapterId)->number;
         		if(arrlenu(chapterPagesInDb->array) == record){
+                    atomic_fetch_add(&job_chapters_downloaded, 1);
         			continue;
         		}
         	}
-        	/* TODO: Add more checks */
-        	download_chapter(chapterId, &local_arena, "downloads");
+
+        	int32_t pages = download_chapter(chapterId, &local_arena, "downloads");
+            if(pages < 0){
+                fprintf(stderr, "Error while downloading %s", chapterId);
+                atomic_fetch_add(&job_chapters_downloaded, 1);
+                continue;
+            }
+            JsonValue* downloadedPages = arena_alloc(&local_arena, sizeof(JsonValue));
+            json_init_array(downloadedPages);
+            for(int32_t i = 1; i < pages+1; i++){
+                json_add_child(downloadedPages, NULL, json_new_number(&local_arena, i));
+            }
+            json_add_child(pagesInDbJson, chapterId, downloadedPages);
+
+            atomic_fetch_add(&job_chapters_downloaded, 1);
         }
         arena_reset(&local_arena);
         json_free(job.chapterInfo);
@@ -745,6 +762,7 @@ DWORD WINAPI download_loop(LPVOID param) {
         has_job = false;
         atomic_store(&downloading, false);
         set_cwo("null");
+        atomic_store(&job_chapters_downloaded, 0);
     }
     fprintf(stderr, "thread ending!\n");
     curl_global_cleanup();
@@ -776,7 +794,7 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
         json_init_object(response);
         json_init_array(queueJson);
 
-        get_cwo(cwo_str, 36);
+        get_cwo(cwo_str, 37);
 
         EnterCriticalSection(&queue->lock);
 
@@ -794,6 +812,8 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
         json_add_child(response, "downloading", json_new_bool(arena, atomic_load(&downloading)));
         json_add_child(response, "queue", queueJson);
         json_add_child(response, "cwo", json_new_string(arena, cwo_str));
+        json_add_child(response, "cwo_chapters", json_new_number(arena, atomic_load(&job_chapters)));
+        json_add_child(response, "cwo_chapters_downloaded", json_new_number(arena, atomic_load(&job_chapters_downloaded)));
 
         return response;
     }else if(strncmp(type->string, "add-job", 7) == 0){
@@ -820,8 +840,8 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
 
         MangaDownloadJob job = {0};
         const char* id = shget(data->object, "identifier")->string;
-        strncpy(job.identifier, id, sizeof(job.identifier) - 1);
-        job.identifier[sizeof(job.identifier) - 1] = '\0';
+        strncpy(job.identifier, id, 36);
+        job.identifier[36] = '\0';
 
         job.chapterInfo = json_dup(chapterInfo);
         job.databaseInfo = json_dup(databaseInfo);
@@ -919,7 +939,6 @@ int main(void)
         JsonValue* response = handle_command(&arena, &queue, &command);
 
         if(response){
-            // TODO: Sending response dose not work recieve does            
             char *json_buf = NULL;
 
             json_print_compact(response, &json_buf);
