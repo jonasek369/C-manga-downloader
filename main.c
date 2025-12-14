@@ -2,18 +2,12 @@
 #include <curl/curl.h>
 #include <windows.h>
 #include <stdatomic.h>
-#include <webp/encode.h>
-#include <webp/types.h>
 
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
 
 #include "json_parser.h"
-
-
 
 
 #define CERTIFICATE_PATH "curl-ca-bundle.crt"
@@ -32,6 +26,9 @@ atomic_int job_chapters = 0;
 
 CRITICAL_SECTION cs;
 char shared_cwo[37];
+
+
+const uint32_t MS_IN_SECONDS = 1000;
 
 void init_cwo() {
     InitializeCriticalSection(&cs);
@@ -124,12 +121,6 @@ void json_print_compact(JsonValue *json, char **out) {
     }
 }
 
-
-typedef struct {
-    char *data;      // arr of char*
-    char *file_path; // file path
-} request_buffer;
-
 size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t total_size = size * nmemb;
 
@@ -141,17 +132,6 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     return total_size;
 }
 
-
-size_t write_image_callback(char *contents, size_t size, size_t nmemb, void *userdata) {
-    size_t total_size = size * nmemb;
-
-    request_buffer *buf = (request_buffer *)userdata;
-    for (size_t i = 0; i < total_size; i++) {
-        arrput((*buf).data, ((char *)contents)[i]);
-    }
-
-    return total_size;
-}
 
 size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
     size_t total_size = size * nitems;
@@ -297,82 +277,34 @@ char* get_request_bytes(const char* url){
     return NULL;
 }
 
-bool save_webp_to_file(const char* filedir, uint8_t* buffer, size_t size){
-    FILE *file = fopen(filedir, "wb");
-    if (file == NULL) {
-        perror("Failed to open file");
-        return 1;
-    }
-    size_t written = fwrite(buffer, sizeof(uint8_t), size, file);
-    if(written != size){
-        perror("Failed to write the complete buffer");
-        fclose(file);
-        return 1;
-    }
-    fclose(file);
-    return 0;
-}
 
-bool save_finish_metadata(const char* filedir){
-    FILE *file = fopen(filedir, "w");
+bool save_finish_metadata(const char* filedir) {
+    char tmpname[1024];
+    snprintf(tmpname, sizeof(tmpname), "%s.tmp", filedir);
+
+    FILE *file = fopen(tmpname, "w");
     if (file == NULL) {
-        perror("Failed to create file");
+        perror("Failed to create temporary file");
         return false;
     }
-    fclose(file);
+
+    if (fclose(file) != 0) {
+        perror("Failed to close temporary file");
+        return false;
+    }
+
+    if (rename(tmpname, filedir) != 0) {
+        perror("Failed to atomically rename temporary file");
+        return false;
+    }
+
     return true;
 }
 
-void page_download_callback(const char* path, char* data) {
-    size_t data_size = arrlenu(data);
-    
-    if (data_size > 12 && memcmp(data, "RIFF", 4) == 0 && 
-        memcmp(data + 8, "WEBP", 4) == 0) {
-        save_webp_to_file(path, (uint8_t*)data, data_size);
-        return;
-    }
-    
-    int width, height, channels;
-    uint8_t* pixels = stbi_load_from_memory((uint8_t*)data, (int)data_size, 
-                                            &width, &height, &channels, 4);
-    if (!pixels) {
-        fprintf(stderr, "Failed to decode image\n");
-        return;
-    }
-    
-    WebPConfig config;
-    WebPConfigInit(&config);
-    config.quality = 80;
-    config.method = 0;
-    config.thread_level = 1;
-    
-    WebPPicture picture;
-    WebPPictureInit(&picture);
-    picture.width = width;
-    picture.height = height;
-    picture.use_argb = 1;
-    
-    WebPPictureImportRGBA(&picture, pixels, width * 4);
-    
-    WebPMemoryWriter writer;
-    WebPMemoryWriterInit(&writer);
-    picture.writer = WebPMemoryWrite;
-    picture.custom_ptr = &writer;
-    
-    if (!WebPEncode(&config, &picture)) {
-        fprintf(stderr, "Failed to encode WebP\n");
-        WebPPictureFree(&picture);
-        stbi_image_free(pixels);
-        return;
-    }
-    
-    save_webp_to_file(path, writer.mem, writer.size);
-    
-    WebPMemoryWriterClear(&writer);
-    WebPPictureFree(&picture);
-    stbi_image_free(pixels);
-}
 
+size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    return fwrite(ptr, size, nmemb, stream);
+}
 
 int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_dir){
     const char* base = "https://api.mangadex.org/at-home/server/";
@@ -385,13 +317,21 @@ int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_d
     JsonValue metadata = {0};
     RateLimitHeader ratelimit = {0};
     get_request_json(url, arena, &metadata, &ratelimit);
-    if(ratelimit.remaining <= 0){
+    if (ratelimit.remaining <= 0) {
         time_t now = time(NULL);
-        time_t remaining = (ratelimit.retryAfter - now) + 5;
+        time_t remaining = ratelimit.retryAfter - now + 5;
+    
         if (remaining > 0) {
             atomic_store(&ratelimited, true);
-            Sleep(remaining * 1000);
+            atomic_store(&downloading, false);
+    
+            DWORD ms = (DWORD)remaining * 1000;
+    
+            fprintf(stderr, "Ratelimited, sleeping for %ld ms\n", (long)ms);
+            Sleep(ms);
+    
             atomic_store(&ratelimited, false);
+            atomic_store(&downloading, true);
         }
     }
     JsonValue* chapter = shget(metadata.object, "chapter");
@@ -411,8 +351,8 @@ int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_d
     if(!nob_mkdir_if_not_exists(in_dir)) return -1;
 
     size_t num_requests = arrlenu(pages);
-    CURL **easy_handles = malloc(num_requests * sizeof(CURL *));
-    request_buffer *buffers = calloc(num_requests, sizeof(request_buffer));
+    CURL** easy_handles = malloc(num_requests * sizeof(CURL *));
+    FILE** file_streams = calloc(num_requests, sizeof(FILE*));
 
     CURLM *multi = curl_multi_init();
     curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 32);
@@ -430,17 +370,35 @@ int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_d
         char* dest_url = arena_alloc(arena, dest_url_size);
         snprintf(dest_url, dest_url_size, "%s/data/%s/%s", baseUrl, hash, pages[i]->string);
         size_t file_path_size = strlen(main_dir)+strlen(chapterId)+strlen(pages[i]->string) + 3;
-        buffers[i].file_path = arena_alloc(arena, file_path_size);
-        snprintf(buffers[i].file_path, file_path_size, "%s/%s/%s", main_dir, chapterId, pages[i]->string);
+        char* file_path = arena_alloc(arena, file_path_size);
+        snprintf(file_path, file_path_size, "%s/%s/%s", main_dir, chapterId, pages[i]->string);
+        FILE* file_stream = fopen(file_path, "wb");
+        if(!file_stream){
+            fprintf(stderr, "Could not create new file %s\n", file_path);
+            file_streams[i] = NULL;
+            continue;
+        }
+        file_streams[i] = file_stream;
 
         easy_handles[i] = curl_easy_init();
         curl_easy_setopt(easy_handles[i], CURLOPT_URL, dest_url);
-        curl_easy_setopt(easy_handles[i], CURLOPT_WRITEFUNCTION, write_image_callback);
-        curl_easy_setopt(easy_handles[i], CURLOPT_WRITEDATA, &buffers[i]);
+        curl_easy_setopt(easy_handles[i], CURLOPT_WRITEFUNCTION, write_data);
+        curl_easy_setopt(easy_handles[i], CURLOPT_WRITEDATA, file_stream);
         curl_easy_setopt(easy_handles[i], CURLOPT_USERAGENT, "Libcurl;Custom-Cjson/1.0");
+        curl_easy_setopt(easy_handles[i], CURLOPT_PRIVATE, (void*)(uintptr_t)i);
         curl_easy_setopt(easy_handles[i], CURLOPT_CAINFO, CERTIFICATE_PATH);
         curl_easy_setopt(easy_handles[i], CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
         curl_easy_setopt(easy_handles[i], CURLOPT_DNS_CACHE_TIMEOUT, 600);
+
+        curl_easy_setopt(easy_handles[i], CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(easy_handles[i], CURLOPT_TCP_KEEPIDLE, 30L);
+        curl_easy_setopt(easy_handles[i], CURLOPT_TCP_KEEPINTVL, 15L);
+
+        curl_easy_setopt(easy_handles[i], CURLOPT_FORBID_REUSE, 0L);
+        curl_easy_setopt(easy_handles[i], CURLOPT_FRESH_CONNECT, 0L);
+
+        curl_easy_setopt(easy_handles[i], CURLOPT_BUFFERSIZE, 1024 * 1024);   // 512 kbs
+
         curl_multi_add_handle(multi, easy_handles[i]);
     }
 
@@ -448,8 +406,12 @@ int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_d
     curl_multi_perform(multi, &still_running);
 
     while (still_running) {
-        curl_multi_wait(multi, NULL, 0, 1000, NULL);
-        curl_multi_perform(multi, &still_running);
+        curl_multi_wait(multi, NULL, 0, MS_IN_SECONDS, NULL);
+        CURLMcode mc = curl_multi_perform(multi, &still_running);
+        if (mc != CURLM_OK) {
+            fprintf(stderr, "curl_multi_perform error: %s\n", curl_multi_strerror(mc));
+            break;
+        }
 
         CURLMsg *msg;
         int msgs_left;
@@ -457,23 +419,26 @@ int32_t download_chapter(const char* chapterId, Arena* arena, const char* main_d
             if (msg->msg == CURLMSG_DONE) {
                 CURL *handle = msg->easy_handle;
 
-                for (size_t i = 0; i < num_requests; i++) {
-                    if (easy_handles[i] == handle) {
-                        page_download_callback(buffers[i].file_path, buffers[i].data);
-                        arrfree(buffers[i].data);
-                        curl_multi_remove_handle(multi, handle);
-                        curl_easy_cleanup(handle);
-                        break;
-                    }
-                }
+                uintptr_t idx;
+                curl_easy_getinfo(handle, CURLINFO_PRIVATE, (void**)&idx);
+
+                fclose(file_streams[idx]);
+                file_streams[idx] = NULL;
+                curl_multi_remove_handle(multi, handle);
+                curl_easy_cleanup(handle);
             }
         }
     }
     
     free(easy_handles);
-    free(buffers);
+    for (size_t i = 0; i < num_requests; i++) {
+        if(file_streams[i] != NULL){
+            fclose(file_streams[i]);
+        }
+    }
+    free(file_streams);
     curl_multi_cleanup(multi);
-    if(save_finish_metadata(finish_path)){
+    if(!save_finish_metadata(finish_path)){
         fprintf(stderr, "Could not save metadata for cuuid: %s\n", chapterId);
     }
     return (int32_t)num_requests;
@@ -663,8 +628,8 @@ bool pushQueue(JobQueue* q, MangaDownloadJob job) {
     q->buffer[q->tail] = job;
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
-    SetEvent(q->dataAvailable); // signal that new data is available
     LeaveCriticalSection(&q->lock);
+    SetEvent(q->dataAvailable); // signal that new data is available
     return true;
 }
 
@@ -748,8 +713,8 @@ DWORD WINAPI download_loop(LPVOID param) {
             }
             JsonValue* downloadedPages = arena_alloc(&local_arena, sizeof(JsonValue));
             json_init_array(downloadedPages);
-            for(int32_t i = 1; i < pages+1; i++){
-                json_add_child(downloadedPages, NULL, json_new_number(&local_arena, i));
+            for(int32_t i = 0; i < pages; i++){
+                json_add_child(downloadedPages, NULL, json_new_number(&local_arena, i+1));
             }
             json_add_child(pagesInDbJson, chapterId, downloadedPages);
 
@@ -806,7 +771,7 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
         }
         
         LeaveCriticalSection(&queue->lock);
-
+        json_add_child(response, "type", json_new_string(arena, "status-response"));
         json_add_child(response, "paused",      json_new_bool(arena, atomic_load(&paused)));
         json_add_child(response, "ratelimited", json_new_bool(arena, atomic_load(&ratelimited)));
         json_add_child(response, "downloading", json_new_bool(arena, atomic_load(&downloading)));
@@ -823,8 +788,17 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
 
         if(!data){
             fprintf(stderr, "Add-job dosent have all needed values!\n");
+            json_add_child(response, "type", json_new_string(arena, "add-job-response"));
             json_add_child(response, "status", json_new_string(arena, "error"));
             json_add_child(response, "message", json_new_string(arena, "No data field provided"));
+            return response;
+        }
+
+        if(queue->count >= queue->capacity-1){
+            fprintf(stderr, "Queue is full\n");
+            json_add_child(response, "type", json_new_string(arena, "add-job-response"));
+            json_add_child(response, "status", json_new_string(arena, "error"));
+            json_add_child(response, "message", json_new_string(arena, "Queue is full!"));
             return response;
         }
 
@@ -833,6 +807,7 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
 
         if(!chapterInfo || !databaseInfo){
             fprintf(stderr, "chapter or database info is NULL!\n");
+            json_add_child(response, "type", json_new_string(arena, "add-job-response"));
             json_add_child(response, "status", json_new_string(arena, "error"));
             json_add_child(response, "message", json_new_string(arena, "No chapterInfo or databaseInfo field provided"));
             return response;
@@ -847,6 +822,7 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
         job.databaseInfo = json_dup(databaseInfo);
 
         pushQueue(queue, job);
+        json_add_child(response, "type", json_new_string(arena, "add-job-response"));
         json_add_child(response, "status", json_new_string(arena, "ok"));
         return response;
     }else if(strncmp(type->string, "pop-job", 7) == 0){
@@ -856,6 +832,7 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
 
         if(!data){
             fprintf(stderr, "Add-job dosent have all needed values!\n");
+            json_add_child(response, "type", json_new_string(arena, "pop-job-response"));
             json_add_child(response, "status", json_new_string(arena, "error"));
             json_add_child(response, "message", json_new_string(arena, "No data field provided"));
             return response;
@@ -882,6 +859,8 @@ JsonValue* handle_command(Arena* arena, JobQueue* queue, JsonValue* command){
         }
         
         LeaveCriticalSection(&queue->lock);
+
+        json_add_child(response, "type", json_new_string(arena, "pop-job-response"));
         json_add_child(response, "status", json_new_string(arena, "ok"));
         return response;
     }
@@ -974,3 +953,4 @@ int main(void)
     destroyQueue(&queue);
     return 0;
 }
+
