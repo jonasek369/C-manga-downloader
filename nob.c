@@ -1,14 +1,9 @@
 #define NOB_IMPLEMENTATION
-#include "nob.h"
+#include "../thirdparty/nob.h"
 
-#define output "main.exe"
+#define output "main"
 
 
-#define webp_incl "your/path/here/to/src"
-#define webp_lib  "your/path/here/to/build"
-
-#define curl_incl "your/path/here/to/include"
-#define curl_lib  "your/path/here/to/lib"
 
 int main(int argc, char **argv)
 {
@@ -16,19 +11,13 @@ int main(int argc, char **argv)
     Nob_Cmd cmd = {0};
 
     nob_cmd_append(&cmd, "gcc",
-        "-I", webp_incl,
-        "-I", curl_incl,
-        "-L", webp_lib,
-        "-L", curl_lib,
         "-g",
         "-Wall",
         "-Wextra",
         "-o", output,
         "main.c",
-        "-lwebp",   // link webp
-        "-lcurl",    // link curl
-        "-lsharpyuv",
-        "-O2"
+        "./tiny_queue/tiny_queue.c",
+        "-lcurl"
     );
 
     if (!nob_cmd_run_sync_and_reset(&cmd)) return 1;
